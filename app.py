@@ -5,6 +5,12 @@
   同时登记原始采样帧坐标下的章节起点与必留口播区间；原始音频保持不变。
 - 初始版本（修订号 0）保留全段；此后按预期修订号提交完整保留清单，
   各段左闭右开、非空、升序、不重叠且在音频范围内，必留口播须完整落入某个保留段。
+- 章节修改：按预期修订号提交完整章节清单（标题 + 原始帧起点）即可修正章节，
+  无须重传音频；沿用创建时的章节校验规则，允许传空数组清空章节。成功时保留段
+  原样沿用，仅推进一次修订；过期或非法提交不改动当前版本。
+- 每个修订都同时冻结当时的保留段与章节清单（不可变快照）：后续删段提交与旧版
+  建议合入使用提交时的章节表，成功响应永远只描述自己写入修订的保留段与章节，
+  即使另一笔章节或剪辑修改随后先一步送达也不受影响。
 - 查询当前版本：返回保留段与换算为成品帧坐标的章节
   （被删除区间内的章节消失，位于保留段起点的章节保留；始终按原始帧计算，不积累偏移）。
 - 旧版建议合入：提交建议依据的基版修订号与完整保留清单，三方（建议 / 当前 / 基版）
@@ -79,6 +85,16 @@ CREATE TABLE IF NOT EXISTS revision_segments (
     end_frame   INTEGER NOT NULL,
     PRIMARY KEY (program_id, revision, idx)
 );
+-- 每个修订同时冻结提交时的章节清单（原始帧坐标）。章节修改只追加新修订，
+-- 历史修订的章节快照永不改写，因此任意修订的响应、查询与下载都彼此一致。
+CREATE TABLE IF NOT EXISTS revision_chapters (
+    program_id  TEXT NOT NULL,
+    revision    INTEGER NOT NULL,
+    idx         INTEGER NOT NULL,
+    title       TEXT NOT NULL,
+    start_frame INTEGER NOT NULL,            -- 原始帧坐标
+    PRIMARY KEY (program_id, revision, idx)
+);
 """
 
 app = Flask(__name__)
@@ -132,9 +148,46 @@ def init_db():
     try:
         conn.executescript(SCHEMA)
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.commit()
+        # 多进程（gunicorn 多 worker）同时启动时，用写锁串行化迁移，
+        # 避免两个进程为同一旧库并发回填章节快照。
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _migrate_revision_chapters(conn)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
     finally:
         conn.close()
+
+
+def _migrate_revision_chapters(conn):
+    """为章节快照功能上线前已存在的节目回填历史修订章节。
+
+    旧库中章节只有一份可变的当前表（chapters），没有按修订冻结；
+    用它回填每个历史修订的快照，使已有节目可继续编辑，且历史修订的
+    查询/下载投影与升级前行为一致。
+    """
+    programs = conn.execute("SELECT id FROM programs").fetchall()
+    for (pid,) in programs:
+        revisions = [
+            r[0]
+            for r in conn.execute(
+                "SELECT revision FROM revisions WHERE program_id = ? ORDER BY revision", (pid,)
+            ).fetchall()
+        ]
+        chapters = conn.execute(
+            "SELECT idx, title, start_frame FROM chapters WHERE program_id = ? ORDER BY idx",
+            (pid,),
+        ).fetchall()
+        for revision in revisions:
+            # INSERT OR IGNORE：回填幂等，并发/重复初始化也不会产生主键冲突
+            conn.executemany(
+                "INSERT OR IGNORE INTO revision_chapters"
+                " (program_id, revision, idx, title, start_frame) VALUES (?,?,?,?,?)",
+                [(pid, revision, idx, title, start) for idx, title, start in chapters],
+            )
 
 
 def get_db():
@@ -437,6 +490,34 @@ def _fetch_chapters(db, pid):
     return [{"title": r["title"], "start_frame": r["start_frame"]} for r in rows]
 
 
+def _fetch_revision_chapters(db, pid, revision):
+    """取某次修订冻结的章节清单（原始帧坐标）。"""
+    rows = db.execute(
+        "SELECT title, start_frame FROM revision_chapters "
+        "WHERE program_id = ? AND revision = ? ORDER BY idx",
+        (pid, revision),
+    ).fetchall()
+    return [{"title": r["title"], "start_frame": r["start_frame"]} for r in rows]
+
+
+def _write_revision(db, pid, revision, created_at, segments, chapters):
+    """原子追加一个不可变修订：保留段与章节清单同时冻结。"""
+    db.execute(
+        "INSERT INTO revisions (program_id, revision, created_at) VALUES (?,?,?)",
+        (pid, revision, created_at),
+    )
+    db.executemany(
+        "INSERT INTO revision_segments (program_id, revision, idx, start_frame, end_frame)"
+        " VALUES (?,?,?,?,?)",
+        [(pid, revision, i, s, e) for i, (s, e) in enumerate(segments)],
+    )
+    db.executemany(
+        "INSERT INTO revision_chapters (program_id, revision, idx, title, start_frame)"
+        " VALUES (?,?,?,?,?)",
+        [(pid, revision, i, c["title"], c["start_frame"]) for i, c in enumerate(chapters)],
+    )
+
+
 def _fetch_must_keeps(db, pid):
     rows = db.execute(
         "SELECT start_frame, end_frame FROM must_keeps WHERE program_id = ? ORDER BY idx", (pid,)
@@ -444,20 +525,22 @@ def _fetch_must_keeps(db, pid):
     return [(r["start_frame"], r["end_frame"]) for r in rows]
 
 
-def _program_payload(db, row, revision=None, segments=None):
+def _program_payload(db, row, revision=None, segments=None, chapters=None):
     """构造版本快照载荷。
 
-    revision 默认取当前修订号；显式传入时，保留段、成品帧数与章节投影都按
+    revision 默认取当前修订号；显式传入时，保留段、章节、成品帧数都按
     该次写入自己的修订计算——提交/合入事务提交后，当前修订号可能已被其它并发
     请求推进，成功响应必须描述本请求实际写入的那个修订，而不是此刻的最新修订。
-    历史修订不可变，故按显式修订号取段与按提交时已算出的段是等价的。
+    每个修订的保留段与章节都是不可变快照，故按显式修订号取数与按提交时已算出
+    的内容是等价的。
     """
     pid = row["id"]
     if revision is None:
         revision = row["current_revision"]
     if segments is None:
         segments = _fetch_segments(db, pid, revision)
-    chapters = _fetch_chapters(db, pid)
+    if chapters is None:
+        chapters = _fetch_revision_chapters(db, pid, revision)
     must_keeps = _fetch_must_keeps(db, pid)
     product_frames = sum(e - s for s, e in segments)
     return {
@@ -511,16 +594,8 @@ def create_program():
             "INSERT INTO must_keeps (program_id, idx, start_frame, end_frame) VALUES (?,?,?,?)",
             [(pid, i, s, e) for i, (s, e) in enumerate(must_keeps)],
         )
-        # 修订 0：保留全段
-        db.execute(
-            "INSERT INTO revisions (program_id, revision, created_at) VALUES (?,?,?)",
-            (pid, 0, now),
-        )
-        db.execute(
-            "INSERT INTO revision_segments (program_id, revision, idx, start_frame, end_frame)"
-            " VALUES (?,?,?,?,?)",
-            (pid, 0, 0, 0, total_frames),
-        )
+        # 修订 0：保留全段，并冻结创建时的章节清单
+        _write_revision(db, pid, 0, now, [(0, total_frames)], chapters)
         db.execute("COMMIT")
     except Exception:
         db.execute("ROLLBACK")
@@ -582,18 +657,12 @@ def put_keeps(pid):
         segments = validate_keep_segments(raw_segments, row["total_frames"])
         must_keeps = _fetch_must_keeps(db, pid)
         check_must_keeps_covered(must_keeps, segments)
+        # 章节沿用提交时的当前章节清单，并在新修订中冻结
+        chapters = _fetch_chapters(db, pid)
 
         new_revision = current + 1
         now = datetime.now(timezone.utc).isoformat()
-        db.execute(
-            "INSERT INTO revisions (program_id, revision, created_at) VALUES (?,?,?)",
-            (pid, new_revision, now),
-        )
-        db.executemany(
-            "INSERT INTO revision_segments (program_id, revision, idx, start_frame, end_frame)"
-            " VALUES (?,?,?,?,?)",
-            [(pid, new_revision, i, s, e) for i, (s, e) in enumerate(segments)],
-        )
+        _write_revision(db, pid, new_revision, now, segments, chapters)
         db.execute(
             "UPDATE programs SET current_revision = ? WHERE id = ?", (new_revision, pid)
         )
@@ -603,9 +672,75 @@ def put_keeps(pid):
         raise
 
     # 返回本次写入的 new_revision 快照，而非此刻的最新修订：
-    # 并发下本请求提交后、响应生成前，可能已有另一个提交/合入再推进修订号，
+    # 并发下本请求提交后、响应生成前，可能已有另一个提交/合入/章节修改再推进修订号，
     # 成功响应中的修订号、保留段、成品帧数与章节投影必须彼此对应。
-    return jsonify(_program_payload(db, row, revision=new_revision, segments=segments))
+    return jsonify(_program_payload(
+        db, row, revision=new_revision, segments=segments, chapters=chapters))
+
+
+@app.put("/programs/<pid>/chapters")
+def put_chapters(pid):
+    """按预期修订号提交完整章节清单，修正标题与原始帧起点，无须重传音频。
+
+    沿用创建节目时的章节校验规则（数组、每项为整数或对象、起点在音频范围内、
+    升序、不重复）；允许传空数组清空章节。成功时保留段原样沿用当前修订，只把
+    章节替换为新清单并推进一次修订。过期修订号或非法清单一律拒绝，当前版本
+    （章节与保留段）保持不变。
+
+    与删段提交、合入共用同一把写事务（BEGIN IMMEDIATE），因此并发的章节修改与
+    剪辑修改彼此按修订号串行化；成功响应只描述本请求自己写入的修订——即使
+    另一笔修改随后先送达并推进了当前修订号，本响应的章节与保留段仍与本修订对应。
+    """
+    body = request.get_json(silent=True)
+    if body is None:
+        raise ApiError(400, "invalid_json", "请求体必须为 JSON（Content-Type: application/json）")
+    if "expected_revision" not in body:
+        raise ApiError(400, "missing_expected_revision", "缺少字段 expected_revision")
+    expected = body["expected_revision"]
+    if not _is_int(expected):
+        raise ApiError(400, "invalid_expected_revision", "expected_revision 必须为整数")
+    if "chapters" not in body:
+        raise ApiError(400, "missing_chapters", "缺少字段 chapters（完整章节清单，允许为空数组）")
+
+    db = get_db()
+    # 与 PUT keeps / merges 同一把写锁：检查修订号、校验章节、替换并写入新修订是原子的。
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = _fetch_program(db, pid)
+        current = row["current_revision"]
+        if expected != current:
+            raise ApiError(
+                409, "stale_revision",
+                f"预期修订号 {expected} 与当前修订号 {current} 不一致；"
+                "请重新查询当前版本后再提交，本次章节修改未生效",
+                current_revision=current,
+            )
+        chapters = parse_chapters(body["chapters"], row["total_frames"])
+        # 保留段原样沿用当前修订
+        segments = _fetch_segments(db, pid, current)
+
+        new_revision = current + 1
+        now = datetime.now(timezone.utc).isoformat()
+        # 先冻结新修订的章节快照，再整体替换可变的当前章节表；
+        # 任一写入失败都会回滚，当前版本不会被部分改动。
+        _write_revision(db, pid, new_revision, now, segments, chapters)
+        db.execute("DELETE FROM chapters WHERE program_id = ?", (pid,))
+        db.executemany(
+            "INSERT INTO chapters (program_id, idx, title, start_frame) VALUES (?,?,?,?)",
+            [(pid, i, c["title"], c["start_frame"]) for i, c in enumerate(chapters)],
+        )
+        db.execute(
+            "UPDATE programs SET current_revision = ? WHERE id = ?", (new_revision, pid)
+        )
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+    # 与 PUT keeps 同理：即使并发的剪辑/章节修改已写入下一个修订，
+    # 本响应仍只描述自己写入的 new_revision（沿用的保留段 + 新章节投影）。
+    return jsonify(_program_payload(
+        db, row, revision=new_revision, segments=segments, chapters=chapters))
 
 
 @app.post("/programs/<pid>/merges")
@@ -672,18 +807,12 @@ def merge_keeps(pid):
 
         must_keeps = _fetch_must_keeps(db, pid)
         check_must_keeps_covered(must_keeps, merged)
+        # 章节沿用合入提交时的当前章节清单，并在新修订中冻结
+        chapters = _fetch_chapters(db, pid)
 
         new_revision = current + 1
         now = datetime.now(timezone.utc).isoformat()
-        db.execute(
-            "INSERT INTO revisions (program_id, revision, created_at) VALUES (?,?,?)",
-            (pid, new_revision, now),
-        )
-        db.executemany(
-            "INSERT INTO revision_segments (program_id, revision, idx, start_frame, end_frame)"
-            " VALUES (?,?,?,?,?)",
-            [(pid, new_revision, i, s, e) for i, (s, e) in enumerate(merged)],
-        )
+        _write_revision(db, pid, new_revision, now, merged, chapters)
         db.execute(
             "UPDATE programs SET current_revision = ? WHERE id = ?", (new_revision, pid)
         )
@@ -694,8 +823,9 @@ def merge_keeps(pid):
 
     # 与 PUT 同理：返回本次合入自己写入的 new_revision 快照。
     # 并发合入时本请求先提交修订 N、另一请求后提交修订 N+1 的情况下，
-    # 这里也必须返回修订 N 的保留段、成品帧数与章节投影，而不是修订 N+1。
-    return jsonify(_program_payload(db, row, revision=new_revision, segments=merged))
+    # 这里也必须返回修订 N 的保留段、章节、成品帧数与章节投影，而不是修订 N+1。
+    return jsonify(_program_payload(
+        db, row, revision=new_revision, segments=merged, chapters=chapters))
 
 
 @app.get("/programs/<pid>/download")
@@ -708,7 +838,7 @@ def download(pid):
         row = _fetch_program(db, pid)
         revision = row["current_revision"]
         segments = _fetch_segments(db, pid, revision)
-        chapters = _fetch_chapters(db, pid)
+        chapters = _fetch_revision_chapters(db, pid, revision)
         wav_bytes = row["wav"]
         db.execute("COMMIT")
     except Exception:

@@ -243,6 +243,419 @@ def test_repeated_edits_use_original_frames_no_drift(client):
     assert proj["c3"] == 32000 + (80000 - 48000)
 
 
+# ---- 章节清单修改 -------------------------------------------------------------
+def _put_chapters(client, pid, expected, chapters):
+    return client.put(f"/programs/{pid}/chapters", json={
+        "expected_revision": expected,
+        "chapters": chapters,
+    })
+
+
+def test_put_chapters_fixes_titles_and_starts_without_audio_reupload(client):
+    pid = _make_program(client)
+    new_chapters = [
+        {"title": "新开场", "start_frame": 0},
+        {"title": "新口播", "start_frame": 50000},
+        {"title": "新正文", "start_frame": 100000},
+    ]
+    resp = _put_chapters(client, pid, 0, new_chapters)
+    assert resp.status_code == 200
+    body = resp.get_json()
+    # 推进一次修订；保留段原样沿用修订 0 的全段
+    assert body["revision"] == 1
+    assert body["keep_segments"] == [{"start_frame": 0, "end_frame": 160000}]
+    assert body["product_frames"] == 160000
+    # 章节替换为新清单并按保留段投影（全保留时成品坐标 == 原始坐标）
+    assert body["chapters"] == [
+        {"title": "新开场", "start_frame": 0, "product_start_frame": 0},
+        {"title": "新口播", "start_frame": 50000, "product_start_frame": 50000},
+        {"title": "新正文", "start_frame": 100000, "product_start_frame": 100000},
+    ]
+
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 1
+    assert [c["title"] for c in cur["chapters"]] == ["新开场", "新口播", "新正文"]
+
+
+def test_put_chapters_allows_clearing_chapters(client):
+    pid = _make_program(client)
+    resp = _put_chapters(client, pid, 0, [])
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["revision"] == 1
+    assert body["chapters"] == []
+    assert body["keep_segments"] == [{"start_frame": 0, "end_frame": 160000}]
+    # 清空后查询与下载都没有章节
+    assert client.get(f"/programs/{pid}").get_json()["chapters"] == []
+    zf = zipfile.ZipFile(io.BytesIO(client.get(f"/programs/{pid}/download").data))
+    assert json.loads(zf.read("chapters.json"))["chapters"] == []
+
+    # 清空后可重新登记章节
+    resp = _put_chapters(client, pid, 1, [{"title": "重来", "start_frame": 123}])
+    assert resp.status_code == 200
+    assert resp.get_json()["revision"] == 2
+    proj = {c["title"]: c["product_start_frame"] for c in resp.get_json()["chapters"]}
+    assert proj == {"重来": 123}
+
+
+def test_put_chapters_accepts_bare_integers_and_default_titles(client):
+    pid = _make_program(client)
+    # 沿用创建时规则：裸整数、默认标题（按提交数组的原始序号命名）、按起点排序去重
+    resp = _put_chapters(client, pid, 0, [100000, 50000])
+    assert resp.status_code == 200
+    assert [c["start_frame"] for c in resp.get_json()["chapters"]] == [50000, 100000]
+    assert [c["title"] for c in resp.get_json()["chapters"]] == ["chapter-2", "chapter-1"]
+
+
+def test_put_chapters_invalid_list_rejected_and_state_unchanged(client):
+    pid = _make_program(client)
+    bad_cases = [
+        "not-a-list",
+        [{"start_frame": 160000}],                # 越界（右开）
+        [{"start_frame": -1}],                    # 越界
+        [100, 100],                               # 起点重复
+        [{"title": "x"}],                         # 缺起点
+        ["不是整数也不是对象"],                     # 章节项类型非法
+    ]
+    for chapters in bad_cases:
+        resp = _put_chapters(client, pid, 0, chapters)
+        assert resp.status_code == 400, chapters
+    # 缺字段 / 非 JSON
+    resp = client.put(f"/programs/{pid}/chapters", json={"expected_revision": 0})
+    assert resp.status_code == 400 and resp.get_json()["error"] == "missing_chapters"
+    resp = client.put(f"/programs/{pid}/chapters",
+                      data="not-json", content_type="application/json")
+    assert resp.status_code == 400 and resp.get_json()["error"] == "invalid_json"
+    # 全部失败后章节与修订号均不变
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 0
+    assert [c["title"] for c in cur["chapters"]] == ["c0", "c1", "c2", "c3", "c4", "c5"]
+
+
+def test_put_chapters_stale_revision_changes_nothing(client):
+    pid = _make_program(client)
+    ok = _put_chapters(client, pid, 0, [{"title": "改", "start_frame": 1000}])
+    assert ok.status_code == 200 and ok.get_json()["revision"] == 1
+
+    stale = _put_chapters(client, pid, 0, [{"title": "过期", "start_frame": 2000}])
+    assert stale.status_code == 409
+    body = stale.get_json()
+    assert body["error"] == "stale_revision"
+    assert body["current_revision"] == 1
+
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 1
+    assert [c["title"] for c in cur["chapters"]] == ["改"]
+
+
+def test_put_chapters_unknown_program_404(client):
+    assert _put_chapters(client, "nope", 0, []).status_code == 404
+
+
+def test_chapters_then_keeps_and_merge_use_commit_time_chapter_list(client):
+    """章节修改之后：删段提交与旧版合入都使用提交时的章节清单。"""
+    pid = _make_program(client)
+    # 修订 1：章节替换为两个新章节
+    assert _put_chapters(client, pid, 0, [
+        {"title": "n0", "start_frame": 0},
+        {"title": "n1", "start_frame": 80000},
+    ]).status_code == 200
+
+    # 修订 2：删段 [32000,48000) 与 [96000,112000)，投影使用新章节
+    r2 = client.put(f"/programs/{pid}/keeps", json={
+        "expected_revision": 1,
+        "keep_segments": [
+            {"start_frame": 0, "end_frame": 32000},
+            {"start_frame": 48000, "end_frame": 96000},
+            {"start_frame": 112000, "end_frame": 160000},
+        ],
+    })
+    assert r2.status_code == 200 and r2.get_json()["revision"] == 2
+    proj = {c["title"]: c["product_start_frame"] for c in r2.get_json()["chapters"]}
+    # n0 在段首 0；n1=80000 落在 [48000,96000) -> 32000+32000=64000
+    assert proj == {"n0": 0, "n1": 64000}
+    # 旧章节标题不再出现
+    assert "c3" not in proj
+
+    # 修订 3：旧版（基于修订 1）合入删除 [128000,144000)，与修订 2 的删除不相交；
+    # 合入成功响应同样使用合入提交时的章节清单（n0/n1）
+    r3 = _merge(client, pid, 1, [
+        {"start_frame": 0, "end_frame": 128000},
+        {"start_frame": 144000, "end_frame": 160000},
+    ])
+    assert r3.status_code == 200 and r3.get_json()["revision"] == 3
+    body3 = r3.get_json()
+    proj3 = {c["title"]: c["product_start_frame"] for c in body3["chapters"]}
+    assert proj3 == {"n0": 0, "n1": 64000}
+    assert body3["keep_segments"] == [
+        {"start_frame": 0, "end_frame": 32000},
+        {"start_frame": 48000, "end_frame": 96000},
+        {"start_frame": 112000, "end_frame": 128000},
+        {"start_frame": 144000, "end_frame": 160000},
+    ]
+
+
+def test_keeps_then_chapters_reprojects_over_current_segments(client):
+    """先删段、再改章节：新章节按当前保留段投影，修订号继续推进。"""
+    pid = _make_program(client)
+    assert client.put(f"/programs/{pid}/keeps", json={
+        "expected_revision": 0,
+        "keep_segments": [
+            {"start_frame": 0, "end_frame": 32000},
+            {"start_frame": 48000, "end_frame": 160000},
+        ],
+    }).status_code == 200
+
+    # 新章节：一个落在被删区间 [32000,48000)（消失），一个在保留段起点（保留），
+    # 一个在保留段中部
+    resp = _put_chapters(client, pid, 1, [
+        {"title": "a", "start_frame": 40000},
+        {"title": "b", "start_frame": 48000},
+        {"title": "c", "start_frame": 80000},
+    ])
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["revision"] == 2
+    # 保留段沿用修订 1
+    assert body["keep_segments"] == [
+        {"start_frame": 0, "end_frame": 32000},
+        {"start_frame": 48000, "end_frame": 160000},
+    ]
+    assert body["product_frames"] == 32000 + 112000
+    proj = {c["title"]: c["product_start_frame"] for c in body["chapters"]}
+    assert proj == {"b": 32000, "c": 32000 + 32000}
+
+
+def test_concurrent_chapters_and_keeps_only_one_takes_effect(client):
+    """并发的章节修改与删段提交基于同一 expected_revision：一个成功，另一个 409。"""
+    pid = _make_program(client)
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def edit_chapters():
+        with app_module.app.test_client() as c:
+            barrier.wait()
+            results["chapters"] = _put_chapters(
+                c, pid, 0, [{"title": "并发章节", "start_frame": 1000}])
+
+    def edit_keeps():
+        with app_module.app.test_client() as c:
+            barrier.wait()
+            results["keeps"] = c.put(f"/programs/{pid}/keeps", json={
+                "expected_revision": 0,
+                "keep_segments": [{"start_frame": 48000, "end_frame": 88000}],
+            })
+
+    t1, t2 = threading.Thread(target=edit_chapters), threading.Thread(target=edit_keeps)
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    statuses = sorted(r.status_code for r in results.values())
+    assert statuses == [200, 409]
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 1
+    if results["chapters"].status_code == 200:
+        assert [c["title"] for c in cur["chapters"]] == ["并发章节"]
+        assert cur["keep_segments"] == [{"start_frame": 0, "end_frame": 160000}]
+        assert results["keeps"].get_json()["error"] == "stale_revision"
+    else:
+        assert cur["keep_segments"] == [{"start_frame": 48000, "end_frame": 88000}]
+        # 保留段 [48000,88000) 下只有 c2=48000 与 c3=80000 的章节可见
+        assert [c["title"] for c in cur["chapters"]] == ["c2", "c3"]
+        assert results["chapters"].get_json()["error"] == "stale_revision"
+
+
+def test_concurrent_chapters_and_keeps_responses_describe_own_revision(client, monkeypatch):
+    """确定性回归：先提交章节修订 1 的请求，在修订 2（删段）写入后仍返回自己的修订。
+
+    章节修改提交修订 1 后在 COMMIT 边界阻塞，等待删段提交完整写入修订 2 并生成响应，
+    再放行第一笔。修复前（章节不按修订冻结）第一笔响应会带上修订 2 的保留段与
+    新章节的混合投影；修复后两笔响应分别只描述自己写入的修订。
+    """
+    pid = _make_program(client)
+    chapters_a = [
+        {"title": "a0", "start_frame": 0},
+        {"title": "a1", "start_frame": 80000},
+    ]
+    keeps_b = [
+        {"start_frame": 0, "end_frame": 32000},
+        {"start_frame": 48000, "end_frame": 160000},
+    ]
+
+    a_committed = threading.Event()
+    b_done = threading.Event()
+    thread_role = threading.local()
+    real_connect = sqlite3.connect
+
+    class CommitHookConn:
+        def __init__(self, conn):
+            role = getattr(thread_role, "role", None)
+            object.__setattr__(self, "_conn", conn)
+            object.__setattr__(self, "_role", role)
+            object.__setattr__(self, "_written_revision", None)
+
+        def execute(self, sql, params=()):
+            conn = object.__getattribute__(self, "_conn")
+            cur = conn.execute(sql, params) if params else conn.execute(sql)
+            text = sql.strip().upper() if isinstance(sql, str) else ""
+            if object.__getattribute__(self, "_role") in ("a", "b"):
+                if text.startswith("UPDATE PROGRAMS SET CURRENT_REVISION") and params:
+                    object.__setattr__(self, "_written_revision", params[0])
+                elif (text == "COMMIT"
+                      and object.__getattribute__(self, "_role") == "a"
+                      and object.__getattribute__(self, "_written_revision") == 1):
+                    a_committed.set()
+                    assert b_done.wait(15), "第二笔提交未在超时内完成"
+            return cur
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_conn"), name)
+
+        def __setattr__(self, name, value):
+            setattr(object.__getattribute__(self, "_conn"), name, value)
+
+    def hooked_connect(*args, **kwargs):
+        return CommitHookConn(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(app_module.sqlite3, "connect", hooked_connect)
+    results = {}
+
+    def edit_a():
+        thread_role.role = "a"
+        with app_module.app.test_client() as c:
+            results["a"] = _put_chapters(c, pid, 0, chapters_a)
+
+    def edit_b():
+        thread_role.role = "b"
+        assert a_committed.wait(15), "第一笔章节修改未在超时内提交"
+        with app_module.app.test_client() as c:
+            results["b"] = c.put(f"/programs/{pid}/keeps", json={
+                "expected_revision": 1,
+                "keep_segments": keeps_b,
+            })
+        b_done.set()
+
+    t1 = threading.Thread(target=edit_a)
+    t2 = threading.Thread(target=edit_b)
+    t1.start(); t2.start()
+    t1.join(20); t2.join(20)
+    assert not t1.is_alive() and not t2.is_alive()
+    assert results["a"].status_code == 200, results["a"].status
+    assert results["b"].status_code == 200, results["b"].status
+
+    body_a, body_b = results["a"].get_json(), results["b"].get_json()
+    # 章节修订 1：全段保留，只含新章节
+    assert body_a["revision"] == 1
+    assert body_a["keep_segments"] == _revision_snapshot(pid, 1)["keep_segments"]
+    assert body_a["chapters"] == _revision_snapshot(pid, 1)["chapters"]
+    assert body_a["product_frames"] == 160000
+    assert {c["title"] for c in body_a["chapters"]} == {"a0", "a1"}
+    # 删段修订 2：沿用提交时的新章节，按新保留段投影
+    assert body_b["revision"] == 2
+    assert body_b["keep_segments"] == keeps_b
+    assert body_b["chapters"] == _revision_snapshot(pid, 2)["chapters"]
+    proj_b = {c["title"]: c["product_start_frame"] for c in body_b["chapters"]}
+    assert proj_b == {"a0": 0, "a1": 32000 + (80000 - 48000)}
+
+    # 当前为修订 2；修订 1 的快照仍可复现（历史修订不可变）
+    assert _revision_snapshot(pid, 1)["product_frames"] == 160000
+    cur = client.get(f"/programs/{pid}").get_json()
+    assert cur["revision"] == 2 and cur["keep_segments"] == keeps_b
+
+
+def test_legacy_db_without_revision_chapters_is_migrated_and_editable(monkeypatch, tmp_path):
+    """升级前建的库（无 revision_chapters）：回填历史快照后节目可继续编辑。"""
+    legacy = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(legacy))
+    conn.executescript("""
+    CREATE TABLE programs (
+        id TEXT PRIMARY KEY, created_at TEXT NOT NULL, sample_rate INTEGER NOT NULL,
+        channels INTEGER NOT NULL, sample_width INTEGER NOT NULL, total_frames INTEGER NOT NULL,
+        wav BLOB NOT NULL, current_revision INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE chapters (
+        program_id TEXT NOT NULL, idx INTEGER NOT NULL, title TEXT NOT NULL,
+        start_frame INTEGER NOT NULL, PRIMARY KEY (program_id, idx));
+    CREATE TABLE must_keeps (
+        program_id TEXT NOT NULL, idx INTEGER NOT NULL, start_frame INTEGER NOT NULL,
+        end_frame INTEGER NOT NULL, PRIMARY KEY (program_id, idx));
+    CREATE TABLE revisions (
+        program_id TEXT NOT NULL, revision INTEGER NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY (program_id, revision));
+    CREATE TABLE revision_segments (
+        program_id TEXT NOT NULL, revision INTEGER NOT NULL, idx INTEGER NOT NULL,
+        start_frame INTEGER NOT NULL, end_frame INTEGER NOT NULL,
+        PRIMARY KEY (program_id, revision, idx));
+    """)
+    conn.execute(
+        "INSERT INTO programs VALUES ('pid1','t',16000,1,2,1000,x'',1)")
+    conn.executemany(
+        "INSERT INTO chapters (program_id, idx, title, start_frame) VALUES (?,?,?,?)",
+        [("pid1", 0, "旧章节", 100), ("pid1", 1, "旧章节2", 600)])
+    conn.execute("INSERT INTO revisions VALUES ('pid1',0,'t')")
+    conn.execute("INSERT INTO revision_segments VALUES ('pid1',0,0,0,1000)")
+    conn.execute("INSERT INTO revisions VALUES ('pid1',1,'t')")
+    conn.executemany(
+        "INSERT INTO revision_segments VALUES (?,?,?,?,?)",
+        [("pid1", 1, 0, 0, 400), ("pid1", 1, 1, 500, 1000)])
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(app_module, "DB_PATH", str(legacy))
+    app_module.init_db()
+    # 再执行一次：回填幂等，不产生重复行
+    app_module.init_db()
+    app_module.app.config.update(TESTING=True)
+
+    with app_module.app.test_client() as c:
+        cur = c.get("/programs/pid1").get_json()
+        assert cur["revision"] == 1
+        # 修订 1 的历史投影与升级前一致：600 落在被删区间 [400,500) 之前的段 [0,400)?
+        # 600 落在 [500,1000) -> 成品 400+(600-500)=500；100 -> 100
+        proj = {ch["title"]: ch["product_start_frame"] for ch in cur["chapters"]}
+        assert proj == {"旧章节": 100, "旧章节2": 500}
+
+        # 已有节目可继续编辑：改章节
+        resp = c.put("/programs/pid1/chapters", json={
+            "expected_revision": 1,
+            "chapters": [{"title": "迁移后", "start_frame": 550}],
+        })
+        assert resp.status_code == 200 and resp.get_json()["revision"] == 2
+        proj = {ch["title"]: ch["product_start_frame"]
+                for ch in resp.get_json()["chapters"]}
+        assert proj == {"迁移后": 400 + 50}
+
+        # 也可继续删段
+        resp = c.put("/programs/pid1/keeps", json={
+            "expected_revision": 2,
+            "keep_segments": [{"start_frame": 0, "end_frame": 400}],
+        })
+        assert resp.status_code == 200 and resp.get_json()["revision"] == 3
+        assert resp.get_json()["chapters"] == []  # 550 不在 [0,400)
+
+
+def test_download_after_chapter_edit_uses_same_revision(client):
+    """章节修改后下载：WAV 与 chapters.json 仍取自同一修订快照。"""
+    pid = _make_program(client)
+    # 先删段（修订 1）
+    client.put(f"/programs/{pid}/keeps", json={
+        "expected_revision": 0,
+        "keep_segments": [
+            {"start_frame": 0, "end_frame": 32000},
+            {"start_frame": 48000, "end_frame": 160000},
+        ],
+    })
+    # 再改章节（修订 2）：标题/起点全部替换
+    assert _put_chapters(client, pid, 1, [
+        {"title": "下载章节", "start_frame": 80000},
+    ]).status_code == 200
+
+    zf = zipfile.ZipFile(io.BytesIO(client.get(f"/programs/{pid}/download").data))
+    doc = json.loads(zf.read("chapters.json"))
+    assert doc["revision"] == 2
+    with wave.open(io.BytesIO(zf.read("audio.wav")), "rb") as w:
+        wav_frames = w.getnframes()
+    assert wav_frames == doc["product_frames"] == 32000 + 112000
+    assert doc["chapters"] == [{"title": "下载章节", "start_frame": 64000}]
+
 # ---- 下载 --------------------------------------------------------------------
 
 def test_download_zip_consistent_with_revision(client):
@@ -606,8 +1019,9 @@ def _revision_snapshot(pid, revision):
         ).fetchall()
         segments = [(s, e) for s, e in seg_rows]
         chapter_rows = conn.execute(
-            "SELECT title, start_frame FROM chapters WHERE program_id = ? ORDER BY idx",
-            (pid,),
+            "SELECT title, start_frame FROM revision_chapters "
+            "WHERE program_id = ? AND revision = ? ORDER BY idx",
+            (pid, revision),
         ).fetchall()
         chapters = [{"title": t, "start_frame": f} for t, f in chapter_rows]
     finally:

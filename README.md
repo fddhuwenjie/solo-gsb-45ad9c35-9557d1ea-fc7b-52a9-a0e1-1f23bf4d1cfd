@@ -1,6 +1,6 @@
 # 录音删段交付 API
 
-对节目录音做「删段」交付的 HTTP 服务：上传原始 WAV 后，按**原始采样帧坐标**反复提交保留清单，随时查询换算为**成品帧坐标**的章节，并下载真正裁接好的成品（WAV + 章节 JSON 的 ZIP）。
+对节目录音做「删段」交付的 HTTP 服务：上传原始 WAV 后，按**原始采样帧坐标**反复提交保留清单，也可随时按修订号修改章节标题与起点（无须重传音频、允许清空），随时查询换算为**成品帧坐标**的章节，并下载真正裁接好的成品（WAV + 章节 JSON 的 ZIP）。
 
 技术栈：Python · Flask · SQLite · 标准库 `wave` / `zipfile`。
 
@@ -32,12 +32,14 @@ python -m pytest tests/ -v
 
 - **音频规格**：≤ 30 秒、16 kHz、单声道、16 位 PCM WAV（上限 480000 帧）。原始音频入库后永不修改。
 - **帧坐标**：所有接口中的坐标均为**原始音频的采样帧坐标**；区间一律**左闭右开** `[start_frame, end_frame)`。
-- **修订号**：创建节目时为 `0`，初始保留全段 `[0, total_frames)`。每次提交保留清单必须带上 `expected_revision`，等于当前修订号才生效，成功后修订号 +1。过期或非法提交会返回原因，旧修订与成品保持原样。
+- **修订号**：创建节目时为 `0`，初始保留全段 `[0, total_frames)`。每次提交保留清单或章节清单必须带上 `expected_revision`，等于当前修订号才生效，成功后修订号 +1。过期或非法提交会返回原因，旧修订与成品保持原样。
 - **保留清单**：完整替换式语义。各段须非空、升序、不重叠、在音频范围内；每个**必留口播区间**必须完整落入某一个保留段。
+- **章节修改**：`PUT /programs/{id}/chapters` 按预期修订号提交**完整章节清单**即可修正标题与原始帧起点，**无须重传音频**；校验规则与创建时完全一致（每项为整数或 `{"title", "start_frame"}`、起点在 `[0, total_frames)` 内、按起点升序且不重复），允许传空数组 `[]` **清空章节**。成功时保留段原样沿用当前修订，只推进一次修订；过期修订号返回 `409 stale_revision`，非法清单返回 `400`，当前章节与保留段均不变。
+- **修订快照**：每个修订都同时冻结当时的**保留段与章节清单**（不可变）。因此后续删段提交与旧版建议合入都使用**提交时**的章节表，删段冲突规则不受影响；任何一笔成功响应——即使它晚于另一笔章节或剪辑修改送达——都只展示**自己写入修订**的章节与保留段。查询与 ZIP 下载也始终从同一修订计算成品音频与章节：被删区间内的章节消失，位于保留段起点的章节保留。
 - **旧版建议合入**：客户端拿着旧修订（基版）做出的剪辑建议，可用 `POST /programs/{id}/merges` 合入。服务端在同一次受保护的当前状态上比较**建议、当前修订、基版**三者的保留状态：两侧相对基版改动的帧区间互不重叠才合成新修订；区间相交即返回 `409 merge_conflict` 与冲突区间（**双方都在删同一段也算冲突**，不擅自覆盖）。基版修订不存在、建议清单非法、合并结果不能保证必留口播完整落入单段时，返回原因且当前版本不变。
-- **成功响应的修订含义**：每次 `PUT .../keeps` 或 `POST .../merges` 成功，响应体都是**该笔请求自己写入的那个修订**的快照——`revision` 即本笔写库的修订号，其中的 `keep_segments`、`product_frames` 与 `chapters` 必然与该修订号对应，并不一定等于响应到达时的最新修订。并发场景下两笔非冲突合入可能连续产生修订 N 与 N+1：先完成的请求即使在提交修订 N 后、响应返回前，另一请求已写入修订 N+1，它拿到的仍是修订 N 的内容；需要最新版本时再 `GET /programs/{id}` 查询。
-- **章节投影**：查询与下载时，章节被换算为成品帧坐标——被删除区间内的章节不再出现；位于保留段**起点**的章节保留（左闭）。换算始终从原始帧出发，反复编辑不会积累偏移。
-- **一致性**：每次成功提交/合入产生一个不可变修订；合入与提交共用同一把写事务（`BEGIN IMMEDIATE`），「比较 -> 校验 -> 写入」原子完成，并发合入不会丢失任何一方已生效的修改：两笔基于同一旧修订、删除互不相交区间的合入都会成功，最终当前版本同时包含两处删除（各占一个修订号，各自成功响应只描述自己写入的修订）。下载在单个读事务内取定修订快照，同一 ZIP 中的 WAV 与 JSON 必然来自同一修订，并发编辑不会混用版本。并发提交同一 `expected_revision` 时只有一个成功，其余收到 `409 stale_revision`。
+- **成功响应的修订含义**：每次 `PUT .../keeps`、`PUT .../chapters` 或 `POST .../merges` 成功，响应体都是**该笔请求自己写入的那个修订**的快照——`revision` 即本笔写库的修订号，其中的 `keep_segments`、`product_frames` 与 `chapters` 必然与该修订号对应，并不一定等于响应到达时的最新修订。并发场景下一笔章节修改与一笔删段提交（或两笔非冲突合入）可能连续产生修订 N 与 N+1：先完成的请求即使在提交修订 N 后、响应返回前，另一请求已写入修订 N+1，它拿到的仍是修订 N 的内容；需要最新版本时再 `GET /programs/{id}` 查询。
+- **章节投影**：查询与下载时，章节被换算为成品帧坐标——被删除区间内的章节不再出现；位于保留段**起点**的章节保留（左闭）。换算始终从原始帧出发，反复编辑不会积累偏移。章节清单本身按修订冻结：历史修订的投影永不改变，删段提交与合入都按提交时的章节清单投影。
+- **一致性**：每次成功提交/合入/章节修改产生一个不可变修订（保留段与章节同时冻结）；三类写操作共用同一把写事务（`BEGIN IMMEDIATE`），「比较 -> 校验 -> 写入」原子完成，并发编辑不会丢失任何一方已生效的修改：两笔基于同一旧修订、删除互不相交区间的合入都会成功，最终当前版本同时包含两处删除（各占一个修订号，各自成功响应只描述自己写入的修订）；并发的章节修改与删段提交基于同一 `expected_revision` 时只有一个成功，另一个收到 `409 stale_revision`。下载在单个读事务内取定修订快照，同一 ZIP 中的 WAV 与 JSON 必然来自同一修订，并发编辑不会混用版本。已有数据库升级后自动补建章节快照，节目可继续编辑。
 
 ## API 一览
 
@@ -48,6 +50,7 @@ python -m pytest tests/ -v
 | GET | `/programs` | 列出全部节目 |
 | GET | `/programs/{id}` | 查询当前版本（保留段 + 成品帧坐标章节） |
 | PUT | `/programs/{id}/keeps` | 按预期修订号提交完整保留清单 |
+| PUT | `/programs/{id}/chapters` | 按预期修订号提交完整章节清单（改标题/起点，可清空，无须重传音频） |
 | POST | `/programs/{id}/merges` | 旧版建议三方合入（`base_revision` + 完整保留清单，帧坐标仍指原始音频） |
 | GET | `/programs/{id}/download` | 下载 ZIP（`audio.wav` + `chapters.json`） |
 
@@ -176,6 +179,70 @@ curl -s -X POST http://localhost:8000/programs/$PID/merges \
 
 两个并发合入各自删除互不相交的区间时，服务端在同一把写事务内完成「比较 → 校验 → 写入」，两处删除都会生效（各产生一个修订号），不会有一方的修改丢失。每个成功响应只描述**自己写入的修订**（修订号与其中的保留段、成品帧数、章节投影相互对应）：先提交者即使在响应返回前另一笔已写入下一个修订号，也仍然拿到自己的修订号与内容；最终当前版本则包含两笔删除，需要时再 `GET /programs/$PID` 查询最新版本。
 
+### 6. 修改章节清单（无须重传音频）
+
+录音入库后，可用 `PUT /programs/{id}/chapters` 按**预期修订号**提交一份**完整章节清单**来修正标题与原始帧起点；原始音频与已裁接成品都不会变化，也不需要重新上传音频。校验规则与创建节目时一致（起点在 `[0, total_frames)` 内、按起点升序、不重复；裸整数会得到默认标题）。成功时**保留段原样沿用**当前修订，只推进一次修订。
+
+接着第 5 步后的状态（当前为**修订 2**），把章节整体替换为新清单：
+
+```bash
+curl -s -X PUT http://localhost:8000/programs/$PID/chapters \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":2,
+       "chapters":[{"title":"新·开场","start_frame":0},
+                   {"title":"新·正文","start_frame":80000},
+                   {"title":"新·结尾","start_frame":150000}]}'
+```
+
+响应 `200`，`revision` 变为 `3`，`keep_segments` 与 `product_frames` 沿用修订 2 不变，章节按当前保留段重新投影（修订 2 已删 `[32000,48000)` 与 `[96000,112000)`，故 80000 -> 成品 64000）：
+
+```json
+{"revision":3,
+ "keep_segments":[
+   {"start_frame":0,"end_frame":32000},
+   {"start_frame":48000,"end_frame":96000},
+   {"start_frame":112000,"end_frame":128000},
+   {"start_frame":144000,"end_frame":160000}],
+ "product_frames":112000,
+ "chapters":[
+   {"title":"新·开场","start_frame":0,"product_start_frame":0},
+   {"title":"新·正文","start_frame":80000,"product_start_frame":64000},
+   {"title":"新·结尾","start_frame":150000,"product_start_frame":102000}]}
+```
+
+允许传空数组**清空全部章节**（同样推进一个修订；之后还可再提交新清单重新登记）：
+
+```bash
+curl -s -X PUT http://localhost:8000/programs/$PID/chapters \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":3,"chapters":[]}'
+# => {"revision":4,"chapters":[], ...保留段与 product_frames 不变...}
+```
+
+过期或非法提交不会改动当前版本：
+
+```bash
+# 修订号过期 -> 409 stale_revision（当前章节与保留段均不变）
+curl -s -X PUT http://localhost:8000/programs/$PID/chapters \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":2,"chapters":[]}'
+# => {"current_revision":4,"error":"stale_revision",
+#     "message":"预期修订号 2 与当前修订号 4 不一致；..."}
+
+# 起点越界 / 重复 / 类型非法 -> 400 invalid_chapters，当前版本不变
+curl -s -X PUT http://localhost:8000/programs/$PID/chapters \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":4,"chapters":[{"title":"越界","start_frame":160000}]}'
+# => {"error":"invalid_chapters","message":"章节起点 160000 超出音频范围 [0, 160000)"}
+```
+
+此后再做删段提交或旧版建议合入，都会使用**提交时**的章节清单冻结进新修订，原有的删段冲突规则保持不变；每笔成功响应只展示自己写入修订的章节与保留段——即使另一笔章节或剪辑修改先一步送达也是如此。查询与下载仍从同一修订计算：
+
+```bash
+curl -s http://localhost:8000/programs/$PID/download -OJ
+# ZIP 文件名 program-$PID-rev4.zip：audio.wav 与 chapters.json 同属修订 4（章节为空）
+```
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -186,8 +253,8 @@ curl -s -X POST http://localhost:8000/programs/$PID/merges \
 ## 项目结构
 
 ```
-app.py               # 全部 API 与核心逻辑（校验、章节投影、裁接、打包）
-tests/test_app.py    # pytest 测试（规格校验、投影、提交/三方合入、冲突、并发不丢修改、下载一致性、持久化）
+app.py               # 全部 API 与核心逻辑（校验、章节修订快照、章节投影、裁接、打包）
+tests/test_app.py    # pytest 测试（规格校验、投影、提交/章节修改/三方合入、冲突、并发不丢修改且响应只描述自己的修订、下载一致性、旧库迁移与持久化）
 requirements.txt     # flask + gunicorn
 Dockerfile           # python:3.12-slim + gunicorn
 docker-compose.yml   # 单条命令启动，卷持久化
